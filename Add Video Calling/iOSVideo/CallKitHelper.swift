@@ -224,6 +224,7 @@ final class CxProviderDelegateImpl : NSObject, CXProviderDelegate {
             try await startAudio(call: activeCall)
         }
     }
+    var currentcall: Call?
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
         Task {
@@ -234,12 +235,14 @@ final class CxProviderDelegateImpl : NSObject, CXProviderDelegate {
             }
             
             let completionBlock : ((Call?, Error?) -> Void) = { (call, error) in
-                
+                self.currentcall = call
                 if error == nil {
                     action.fulfill()
                     Task {
                         await self.callKitHelper.addActiveCall(callId: action.callUUID.uuidString,
                                                                call: call!)
+                        self.toggleSendingRawOutgoingVideo()
+
                     }
                 } else {
                     action.fail()
@@ -266,30 +269,38 @@ final class CxProviderDelegateImpl : NSObject, CXProviderDelegate {
             mutedAudioOptions.speakerMuted = true
             mutedAudioOptions.muted = true
             
-            if let participants = outInCallInfo.participants {
-                let copyStartCallOptions = StartCallOptions()
-                if let startCallOptions = outInCallInfo.options as? StartCallOptions {
-                    copyStartCallOptions.videoOptions = startCallOptions.videoOptions
-                }
-                
-                copyStartCallOptions.audioOptions = mutedAudioOptions
-                callAgent.startCall(participants: participants,
-                                    options: copyStartCallOptions,
-                                    completionHandler: completionBlock)
-            } else if let meetingLocator = outInCallInfo.meetingLocator {
-                let copyJoinCallOptions = JoinCallOptions()
-                if let joinCallOptions = outInCallInfo.options as? JoinCallOptions {
-                    copyJoinCallOptions.videoOptions = joinCallOptions.videoOptions
-                }
-                
-                copyJoinCallOptions.audioOptions = mutedAudioOptions
-                callAgent.join(with: meetingLocator,
-                               joinCallOptions: copyJoinCallOptions,
-                               completionHandler: completionBlock)
-            } else {
-                completionBlock(nil, CallKitErrors.unknownOutgoingCallType)
+            let copyJoinCallOptions = JoinCallOptions()
+            copyJoinCallOptions.videoOptions = VideoOptions(outgoingVideoStreams: [])
+            
+            
+            copyJoinCallOptions.audioOptions = mutedAudioOptions
+            guard let uuid = UUID(uuidString: "89c04b6f-9fcd-4e6d-bc23-c8f8d8be7b6e") else {
+                fatalError("Invalid UUID")
             }
+            await UIDevice.current.beginGeneratingDeviceOrientationNotifications();
+
+            callAgent.join(with: GroupCallLocator(groupId: uuid),
+                           joinCallOptions: copyJoinCallOptions,
+                           completionHandler: completionBlock)
+                        
         }
+    }
+    var outgoingVideoSender:  RawOutgoingVideoSender?
+    var sendingRawVideo: Bool = false
+
+    func toggleSendingRawOutgoingVideo() {
+        guard let call = currentcall else {
+            return
+        }
+        if sendingRawVideo {
+            outgoingVideoSender?.stopSending()
+            outgoingVideoSender = nil
+        } else {
+            let producer = GrayLinesFrameProducer()
+            outgoingVideoSender = RawOutgoingVideoSender(frameProducer: producer)
+            outgoingVideoSender?.startSending(to: call)
+        }
+        sendingRawVideo.toggle()
     }
 }
 
@@ -547,4 +558,221 @@ actor CallKitHelper {
                                                                   options: options, completionHandler: completionHandler))
     }
     
+}
+
+
+
+
+
+//************** Raw media capabilities ************************//
+protocol FrameProducerProtocol {
+    func nextFrame(for format: VideoFormat) -> CVImageBuffer
+}
+
+// Produces random gray stripes.
+final class GrayLinesFrameProducer: FrameProducerProtocol {
+    var buffer: CVPixelBuffer? = nil
+    private var currentFormat: VideoFormat?
+
+    func nextFrame(for format: VideoFormat) -> CVImageBuffer {
+        let bandsCount = Int.random(in: 10..<25)
+        let bandThickness = Int(format.height * format.width) / bandsCount
+
+        let currentFormat = self.currentFormat ?? format
+        let bufferSizeChanged = currentFormat.width != format.width ||
+                             currentFormat.height != format.height ||
+                             currentFormat.stride1 != format.stride1
+
+        let newBuffer = buffer == nil || bufferSizeChanged
+        if newBuffer {
+            // Make ARC release previous reusable buffer
+            self.buffer = nil
+            let attrs = [
+                kCVPixelBufferBytesPerRowAlignmentKey: Int(format.stride1)
+            ] as CFDictionary
+            guard CVPixelBufferCreate(kCFAllocatorDefault, Int(format.width), Int(format.height),
+                                      kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, attrs, &buffer) == kCVReturnSuccess else {
+                fatalError()
+            }
+        }
+
+        self.currentFormat = format
+        guard let frameBuffer = buffer else {
+            fatalError()
+        }
+
+        CVPixelBufferLockBaseAddress(frameBuffer, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(frameBuffer, .readOnly)
+        }
+
+        // Fill NV12 Y plane with different luminance for each band.
+        var begin = 0
+        guard let yPlane = CVPixelBufferGetBaseAddressOfPlane(frameBuffer, 0) else {
+            fatalError()
+        }
+        for _ in 0..<bandsCount {
+            let luminance = Int32.random(in: 100..<255)
+            memset(yPlane + begin, luminance, bandThickness)
+            begin += bandThickness
+        }
+
+        if newBuffer {
+            guard let uvPlane = CVPixelBufferGetBaseAddressOfPlane(frameBuffer, 1) else {
+                fatalError()
+            }
+            memset(uvPlane, 128, Int((format.height * format.width) / 2))
+        }
+
+        return frameBuffer
+    }
+}
+
+final class RawOutgoingVideoSender: NSObject {
+    var frameSender: VideoFrameSender?
+    let frameProducer: FrameProducerProtocol
+    var rawOutgoingStream: RawOutgoingVideoStream!
+
+    private var lock: NSRecursiveLock = NSRecursiveLock()
+
+    private var timer: Timer?
+    private var syncSema: DispatchSemaphore?
+    private(set) weak var call: Call?
+    private var running: Bool = false
+    private let frameQueue: DispatchQueue = DispatchQueue(label: "org.microsoft.frame-sender")
+
+    private var options: RawOutgoingVideoStreamOptions!
+    private var outgoingVideoStreamState: OutgoingVideoStreamState = .none
+    let videoFormats: [VideoFormat] = []
+
+    
+
+
+
+    init(frameProducer: FrameProducerProtocol) {
+        let videoFormat = VideoFormat()
+        videoFormat.width = 1280;
+        videoFormat.height = 720;
+        videoFormat.pixelFormat = .nv12;
+        videoFormat.videoFrameKind = .videoSoftware;
+        videoFormat.framesPerSecond = 30;
+        videoFormat.stride1 = 1280;
+        videoFormat.stride2 = 1280;
+        
+        self.frameProducer = frameProducer
+        super.init()
+        options = RawOutgoingVideoStreamOptions()
+        options.delegate = self
+        options.videoFormats = [videoFormat] // Video format we specified on step 1.
+        self.rawOutgoingStream = VirtualRawOutgoingVideoStream(videoStreamOptions: options)
+        
+        
+        
+
+        let virtualRawOutgoingVideoStream = VirtualRawOutgoingVideoStream(videoStreamOptions: options)
+        
+    }
+
+    
+
+    func startSending(to call: Call) {
+        self.call = call
+        self.startRunning()
+        self.call?.startVideo(stream: rawOutgoingStream) { error in
+            // Stream sending started.
+        }
+    }
+
+    func stopSending() {
+        self.stopRunning()
+        call?.stopVideo(stream: rawOutgoingStream) { error in
+            // Stream sending stopped.
+        }
+    }
+
+    private func startRunning() {
+        lock.lock(); defer { lock.unlock() }
+
+        self.running = true
+        if frameSender != nil {
+            self.startFrameGenerator()
+        }
+    }
+
+    private func startFrameGenerator() {
+        guard let sender = self.frameSender else {
+            return
+        }
+
+        // How many times per second, based on sender format FPS.
+        let interval = TimeInterval((1 as Float) / sender.videoFormat.framesPerSecond)
+        frameQueue.async { [weak self] in
+            self?.timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+                guard let self = self, let sender = self.frameSender else {
+                    return
+                }
+
+                let planeData = self.frameProducer.nextFrame(for: sender.videoFormat)
+                self.sendSync(with: sender, frame: planeData)
+            }
+            RunLoop.current.run()
+            self?.timer?.fire()
+        }
+    }
+
+    private func sendSync(with sender: VideoFrameSender, frame: CVImageBuffer) {
+        guard let softwareSender = sender as? SoftwareBasedVideoFrameSender else {
+           return
+        }
+        // Ensure that a frame will not be sent before another finishes.
+        syncSema = DispatchSemaphore(value: 0)
+        softwareSender.send(frame: frame, timestampInTicks: sender.timestampInTicks) { [weak self] confirmation, error in
+            self?.syncSema?.signal()
+            guard let self = self else { return }
+            if let confirmation = confirmation {
+                // Can check if confirmation was successful using `confirmation.status`
+            } else if let error = error {
+                // Can check details about error in case of failure.
+            }
+        }
+        syncSema?.wait()
+    }
+
+    private func stopRunning() {
+        lock.lock(); defer { lock.unlock() }
+
+        running = false
+        stopFrameGeneration()
+    }
+
+    private func stopFrameGeneration() {
+        lock.lock(); defer { lock.unlock() }
+        timer?.invalidate()
+        timer = nil
+    }
+
+    deinit {
+        timer?.invalidate()
+        timer = nil
+    }
+}
+
+extension RawOutgoingVideoSender: RawOutgoingVideoStreamOptionsDelegate {
+    func rawOutgoingVideoStreamOptions(_ rawOutgoingVideoStreamOptions: RawOutgoingVideoStreamOptions,
+                                       didChangeOutgoingVideoStreamState args: OutgoingVideoStreamStateChangedEventArgs) {
+        outgoingVideoStreamState = args.outgoingVideoStreamState
+    }
+
+    func rawOutgoingVideoStreamOptions(_ rawOutgoingVideoStreamOptions: RawOutgoingVideoStreamOptions,
+                                       didChangeVideoFrameSender args: VideoFrameSenderChangedEventArgs) {
+        // Sender can change to start sending a more efficient format (given network conditions) of the ones specified
+        // in the list on the initial step. In that case, you should restart the sender.
+        if running {
+            stopRunning()
+            self.frameSender = args.videoFrameSender
+            startRunning()
+        } else {
+            self.frameSender = args.videoFrameSender
+        }
+    }
 }
